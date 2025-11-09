@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 // Public modules
 pub mod cosm;
 pub mod results;
+pub mod visualization;
 
 /// Historical data from optimization iterations
 ///
