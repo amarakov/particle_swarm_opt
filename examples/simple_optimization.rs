@@ -8,6 +8,8 @@
 use particle_swarm_opt::{Hyperparameters, Swarm};
 
 fn main() {
+    println!("=== Particle Swarm Optimization Demo ===\n");
+
     // Define a simple fitness function: sphere function (sum of squares)
     // The optimal value is 0 at position [0, 0, 0, ...]
     let fitness_fn = |position: &[f64]| -> f64 {
@@ -22,33 +24,74 @@ fn main() {
         10.0,    // upper_bound for all dimensions
     );
 
-    println!("Initializing PSO with {} particles in {} dimensions",
-             hyperparams.swarm_size,
-             hyperparams.dimensions());
-    println!("Search space: [{}, {}]^{}",
+    println!("Configuration:");
+    println!("  Particles: {}", hyperparams.swarm_size);
+    println!("  Dimensions: {}", hyperparams.dimensions());
+    println!("  Search space: [{}, {}]^{}",
              hyperparams.lower_bounds[0],
              hyperparams.upper_bounds[0],
              hyperparams.dimensions());
+    println!("  Inertia weight: {}", hyperparams.inertia_weight);
+    println!("  Cognitive coefficient: {}", hyperparams.cognitive_coeff);
+    println!("  Social coefficient: {}", hyperparams.social_coeff);
     println!();
 
     // Initialize the swarm
-    let swarm = Swarm::new(hyperparams, fitness_fn);
+    println!("Initializing swarm...");
+    let mut swarm = Swarm::new(hyperparams, &fitness_fn);
 
-    println!("Swarm initialized successfully!");
-    println!("Number of particles: {}", swarm.size());
-    println!("Global best fitness: {:.6}", swarm.global_best_fitness);
-    println!("Global best position: {:?}", swarm.global_best_position);
+    println!("Initial state:");
+    println!("  Global best fitness: {:.6}", swarm.global_best_fitness);
+    println!("  Global best position: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+             swarm.global_best_position[0],
+             swarm.global_best_position[1],
+             swarm.global_best_position[2],
+             swarm.global_best_position[3],
+             swarm.global_best_position[4]);
     println!();
 
-    // Display some particle information
-    println!("Sample particle positions:");
-    for (i, particle) in swarm.particles.iter().take(5).enumerate() {
-        println!("  Particle {}: position={:?}, fitness={:.6}",
-                 i,
-                 particle.position,
-                 particle.fitness);
+    // Run optimization
+    println!("Starting optimization for 100 iterations...");
+    let max_iterations = 100;
+    let history = swarm.optimize(&fitness_fn, max_iterations);
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+
+    // Display results
+    println!("Final results:");
+    println!("  Iterations: {}", history.len());
+    println!("  Global best fitness: {:.10}", swarm.global_best_fitness);
+    println!("  Global best position: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
+             swarm.global_best_position[0],
+             swarm.global_best_position[1],
+             swarm.global_best_position[2],
+             swarm.global_best_position[3],
+             swarm.global_best_position[4]);
+    println!();
+
+    // Show convergence progress
+    println!("Convergence progress (every 10 iterations):");
+    for (i, iter_data) in history.iterations.iter().enumerate() {
+        if i % 10 == 0 || i == history.len() - 1 {
+            println!("  Iteration {:3}: fitness = {:.10}",
+                     iter_data.iteration,
+                     iter_data.global_best_fitness);
+        }
     }
     println!();
 
-    println!("Phase 1 complete: Core engine foundation established!");
+    // Calculate improvement
+    let initial_fitness = history.iterations[0].global_best_fitness;
+    let final_fitness = swarm.global_best_fitness;
+    let improvement = ((initial_fitness - final_fitness) / initial_fitness) * 100.0;
+
+    println!("Performance:");
+    println!("  Initial fitness: {:.6}", initial_fitness);
+    println!("  Final fitness: {:.10}", final_fitness);
+    println!("  Improvement: {:.2}%", improvement);
+    println!();
+
+    println!("Phase 2 complete: Optimization loop implemented!");
 }
