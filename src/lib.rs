@@ -4,6 +4,76 @@
 //! for optimizing COSM parameters using Rust's type system.
 
 use rand::Rng;
+use rayon::prelude::*;
+
+/// Historical data from optimization iterations
+///
+/// Stores data for each iteration to enable visualization and analysis
+#[derive(Debug, Clone)]
+pub struct IterationHistory {
+    /// Iteration number
+    pub iteration: usize,
+    /// Global best fitness at this iteration
+    pub global_best_fitness: f64,
+    /// Global best position at this iteration
+    pub global_best_position: Vec<f64>,
+    /// Positions of all particles at this iteration
+    pub particle_positions: Vec<Vec<f64>>,
+    /// Fitness values of all particles at this iteration
+    pub particle_fitnesses: Vec<f64>,
+}
+
+/// Complete optimization history
+///
+/// Contains all iteration data for visualization in Phase 4
+#[derive(Debug, Clone)]
+pub struct OptimizationHistory {
+    /// History for each iteration
+    pub iterations: Vec<IterationHistory>,
+}
+
+impl OptimizationHistory {
+    /// Creates a new empty optimization history
+    pub fn new() -> Self {
+        Self {
+            iterations: Vec::new(),
+        }
+    }
+
+    /// Adds a new iteration record to the history
+    pub fn record_iteration(
+        &mut self,
+        iteration: usize,
+        global_best_fitness: f64,
+        global_best_position: Vec<f64>,
+        particle_positions: Vec<Vec<f64>>,
+        particle_fitnesses: Vec<f64>,
+    ) {
+        self.iterations.push(IterationHistory {
+            iteration,
+            global_best_fitness,
+            global_best_position,
+            particle_positions,
+            particle_fitnesses,
+        });
+    }
+
+    /// Returns the number of iterations recorded
+    pub fn len(&self) -> usize {
+        self.iterations.len()
+    }
+
+    /// Returns true if no iterations have been recorded
+    pub fn is_empty(&self) -> bool {
+        self.iterations.is_empty()
+    }
+}
+
+impl Default for OptimizationHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Hyperparameters for the Particle Swarm Optimization algorithm
 #[derive(Debug, Clone)]
@@ -138,10 +208,83 @@ impl Particle {
     }
 
     /// Updates the particle's personal best if current position is better
-    fn update_personal_best(&mut self) {
+    pub fn update_personal_best(&mut self) {
         if self.fitness < self.best_fitness {
             self.best_fitness = self.fitness;
             self.best_position = self.position.clone();
+        }
+    }
+
+    /// Updates the particle's velocity using the PSO velocity update equation
+    ///
+    /// The new velocity is computed as:
+    /// v_new = w * v_old + c1 * r1 * (p_best - p_current) + c2 * r2 * (g_best - p_current)
+    ///
+    /// Where:
+    /// - w: inertia weight (controls influence of previous velocity)
+    /// - c1: cognitive coefficient (attraction to personal best)
+    /// - c2: social coefficient (attraction to global best)
+    /// - r1, r2: random numbers in [0, 1]
+    ///
+    /// # Arguments
+    ///
+    /// * `hyperparams` - Reference to hyperparameters containing PSO coefficients
+    /// * `global_best_position` - The global best position found by the swarm
+    /// * `rng` - Random number generator
+    pub fn update_velocity<R: Rng>(
+        &mut self,
+        hyperparams: &Hyperparameters,
+        global_best_position: &[f64],
+        rng: &mut R,
+    ) {
+        let w = hyperparams.inertia_weight;
+        let c1 = hyperparams.cognitive_coeff;
+        let c2 = hyperparams.social_coeff;
+
+        for i in 0..self.velocity.len() {
+            let r1: f64 = rng.r#gen();
+            let r2: f64 = rng.r#gen();
+
+            // Inertia component
+            let inertia = w * self.velocity[i];
+
+            // Cognitive component (attraction to personal best)
+            let cognitive = c1 * r1 * (self.best_position[i] - self.position[i]);
+
+            // Social component (attraction to global best)
+            let social = c2 * r2 * (global_best_position[i] - self.position[i]);
+
+            // Update velocity
+            self.velocity[i] = inertia + cognitive + social;
+        }
+    }
+
+    /// Updates the particle's position and handles boundary violations
+    ///
+    /// The position is updated by adding the velocity. If the particle moves outside
+    /// the search space bounds, the "reflect" boundary handling strategy is used:
+    /// the particle's position is set to the boundary and its velocity in that
+    /// dimension is inverted, causing it to "bounce" back.
+    ///
+    /// # Arguments
+    ///
+    /// * `hyperparams` - Reference to hyperparameters containing bounds
+    pub fn update_position(&mut self, hyperparams: &Hyperparameters) {
+        for i in 0..self.position.len() {
+            // Update position
+            self.position[i] += self.velocity[i];
+
+            // Handle lower boundary violation (reflect)
+            if self.position[i] < hyperparams.lower_bounds[i] {
+                self.position[i] = hyperparams.lower_bounds[i];
+                self.velocity[i] = -self.velocity[i]; // Invert velocity to bounce back
+            }
+
+            // Handle upper boundary violation (reflect)
+            if self.position[i] > hyperparams.upper_bounds[i] {
+                self.position[i] = hyperparams.upper_bounds[i];
+                self.velocity[i] = -self.velocity[i]; // Invert velocity to bounce back
+            }
         }
     }
 }
@@ -240,6 +383,171 @@ impl Swarm {
     /// Returns the number of particles in the swarm
     pub fn size(&self) -> usize {
         self.particles.len()
+    }
+
+    /// Runs the PSO optimization loop for a specified number of iterations
+    ///
+    /// This is the main optimization method that:
+    /// 1. Evaluates fitness for all particles in parallel using Rayon
+    /// 2. Updates personal and global bests
+    /// 3. Updates velocities based on PSO equations
+    /// 4. Updates positions with boundary handling
+    /// 5. Records iteration history for visualization
+    ///
+    /// # Arguments
+    ///
+    /// * `fitness_fn` - Objective function to minimize (takes &[f64], returns f64)
+    /// * `max_iterations` - Maximum number of iterations to run
+    ///
+    /// # Returns
+    ///
+    /// OptimizationHistory containing data from all iterations
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use particle_swarm_opt::{Swarm, Hyperparameters};
+    ///
+    /// let fitness_fn = |position: &[f64]| {
+    ///     position.iter().map(|x| x * x).sum()
+    /// };
+    ///
+    /// let hyperparams = Hyperparameters::new(30, 2, -10.0, 10.0);
+    /// let mut swarm = Swarm::new(hyperparams, &fitness_fn);
+    /// let history = swarm.optimize(&fitness_fn, 100);
+    ///
+    /// println!("Final best fitness: {}", swarm.global_best_fitness);
+    /// ```
+    pub fn optimize<F>(&mut self, fitness_fn: F, max_iterations: usize) -> OptimizationHistory
+    where
+        F: Fn(&[f64]) -> f64 + Sync,
+    {
+        let mut history = OptimizationHistory::new();
+        let mut rng = rand::thread_rng();
+
+        for iteration in 0..max_iterations {
+            // Evaluate fitness for all particles in parallel
+            self.particles.par_iter_mut().for_each(|particle| {
+                particle.fitness = fitness_fn(&particle.position);
+            });
+
+            // Update personal bests
+            for particle in &mut self.particles {
+                particle.update_personal_best();
+            }
+
+            // Find and update global best
+            for particle in &self.particles {
+                if particle.best_fitness < self.global_best_fitness {
+                    self.global_best_fitness = particle.best_fitness;
+                    self.global_best_position = particle.best_position.clone();
+                }
+            }
+
+            // Record iteration history
+            let particle_positions: Vec<Vec<f64>> = self.particles
+                .iter()
+                .map(|p| p.position.clone())
+                .collect();
+            let particle_fitnesses: Vec<f64> = self.particles
+                .iter()
+                .map(|p| p.fitness)
+                .collect();
+
+            history.record_iteration(
+                iteration,
+                self.global_best_fitness,
+                self.global_best_position.clone(),
+                particle_positions,
+                particle_fitnesses,
+            );
+
+            // Update velocities and positions for all particles
+            for particle in &mut self.particles {
+                particle.update_velocity(&self.hyperparameters, &self.global_best_position, &mut rng);
+                particle.update_position(&self.hyperparameters);
+            }
+        }
+
+        history
+    }
+
+    /// Optimizes with a termination condition based on fitness threshold
+    ///
+    /// Runs optimization until either the maximum number of iterations is reached
+    /// or the global best fitness falls below the target threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `fitness_fn` - Objective function to minimize
+    /// * `max_iterations` - Maximum number of iterations
+    /// * `target_fitness` - Stop when global best fitness is below this value
+    ///
+    /// # Returns
+    ///
+    /// OptimizationHistory containing data from all iterations
+    pub fn optimize_until<F>(
+        &mut self,
+        fitness_fn: F,
+        max_iterations: usize,
+        target_fitness: f64,
+    ) -> OptimizationHistory
+    where
+        F: Fn(&[f64]) -> f64 + Sync,
+    {
+        let mut history = OptimizationHistory::new();
+        let mut rng = rand::thread_rng();
+
+        for iteration in 0..max_iterations {
+            // Evaluate fitness for all particles in parallel
+            self.particles.par_iter_mut().for_each(|particle| {
+                particle.fitness = fitness_fn(&particle.position);
+            });
+
+            // Update personal bests
+            for particle in &mut self.particles {
+                particle.update_personal_best();
+            }
+
+            // Find and update global best
+            for particle in &self.particles {
+                if particle.best_fitness < self.global_best_fitness {
+                    self.global_best_fitness = particle.best_fitness;
+                    self.global_best_position = particle.best_position.clone();
+                }
+            }
+
+            // Record iteration history
+            let particle_positions: Vec<Vec<f64>> = self.particles
+                .iter()
+                .map(|p| p.position.clone())
+                .collect();
+            let particle_fitnesses: Vec<f64> = self.particles
+                .iter()
+                .map(|p| p.fitness)
+                .collect();
+
+            history.record_iteration(
+                iteration,
+                self.global_best_fitness,
+                self.global_best_position.clone(),
+                particle_positions,
+                particle_fitnesses,
+            );
+
+            // Check termination condition
+            if self.global_best_fitness < target_fitness {
+                break;
+            }
+
+            // Update velocities and positions for all particles
+            for particle in &mut self.particles {
+                particle.update_velocity(&self.hyperparameters, &self.global_best_position, &mut rng);
+                particle.update_position(&self.hyperparameters);
+            }
+        }
+
+        history
     }
 }
 
@@ -382,5 +690,175 @@ mod tests {
             assert!(particle.position[1] >= -2.0 && particle.position[1] <= 2.0);
             assert!(particle.position[2] >= -3.0 && particle.position[2] <= 3.0);
         }
+    }
+
+    #[test]
+    fn test_velocity_update() {
+        let hyperparams = Hyperparameters::new(10, 2, -5.0, 5.0);
+        let mut rng = rand::thread_rng();
+        let mut particle = Particle::new(&hyperparams, &mut rng);
+
+        // Set up initial state
+        particle.position = vec![1.0, 1.0];
+        particle.velocity = vec![0.5, -0.5];
+        particle.best_position = vec![2.0, 0.0];
+
+        let global_best = vec![0.0, 0.0];
+
+        // Update velocity
+        particle.update_velocity(&hyperparams, &global_best, &mut rng);
+
+        // Velocity should have changed (not exact values due to randomness)
+        assert_ne!(particle.velocity, vec![0.5, -0.5]);
+
+        // Velocity should be reasonable (not infinite)
+        for v in &particle.velocity {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_position_update_within_bounds() {
+        let hyperparams = Hyperparameters::new(10, 2, -5.0, 5.0);
+        let mut rng = rand::thread_rng();
+        let mut particle = Particle::new(&hyperparams, &mut rng);
+
+        // Set up position and velocity
+        particle.position = vec![1.0, 2.0];
+        particle.velocity = vec![0.5, -1.0];
+
+        particle.update_position(&hyperparams);
+
+        // Position should be updated
+        assert_eq!(particle.position, vec![1.5, 1.0]);
+
+        // Velocity should remain unchanged (no boundary violation)
+        assert_eq!(particle.velocity, vec![0.5, -1.0]);
+    }
+
+    #[test]
+    fn test_position_update_boundary_reflect() {
+        let hyperparams = Hyperparameters::new(10, 2, -5.0, 5.0);
+        let mut rng = rand::thread_rng();
+        let mut particle = Particle::new(&hyperparams, &mut rng);
+
+        // Test upper boundary reflection
+        particle.position = vec![4.5, 0.0];
+        particle.velocity = vec![1.0, 0.0];
+        particle.update_position(&hyperparams);
+
+        assert_eq!(particle.position[0], 5.0); // Clamped to boundary
+        assert_eq!(particle.velocity[0], -1.0); // Velocity reflected
+
+        // Test lower boundary reflection
+        particle.position = vec![-4.5, 0.0];
+        particle.velocity = vec![-1.0, 0.0];
+        particle.update_position(&hyperparams);
+
+        assert_eq!(particle.position[0], -5.0); // Clamped to boundary
+        assert_eq!(particle.velocity[0], 1.0); // Velocity reflected
+    }
+
+    #[test]
+    fn test_optimization_history() {
+        let mut history = OptimizationHistory::new();
+
+        assert!(history.is_empty());
+        assert_eq!(history.len(), 0);
+
+        // Add an iteration
+        history.record_iteration(
+            0,
+            10.5,
+            vec![1.0, 2.0],
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            vec![10.5, 20.3],
+        );
+
+        assert!(!history.is_empty());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.iterations[0].iteration, 0);
+        assert_eq!(history.iterations[0].global_best_fitness, 10.5);
+    }
+
+    #[test]
+    fn test_optimize_basic() {
+        // Simple sphere function
+        let fitness_fn = |position: &[f64]| -> f64 {
+            position.iter().map(|x| x * x).sum()
+        };
+
+        let hyperparams = Hyperparameters::new(20, 2, -10.0, 10.0);
+        let mut swarm = Swarm::new(hyperparams, &fitness_fn);
+
+        let initial_fitness = swarm.global_best_fitness;
+
+        // Run optimization
+        let history = swarm.optimize(&fitness_fn, 50);
+
+        // Fitness should improve
+        assert!(swarm.global_best_fitness < initial_fitness);
+
+        // History should have correct number of iterations
+        assert_eq!(history.len(), 50);
+
+        // Each iteration should have data
+        for iter_data in &history.iterations {
+            assert_eq!(iter_data.particle_positions.len(), 20);
+            assert_eq!(iter_data.particle_fitnesses.len(), 20);
+        }
+    }
+
+    #[test]
+    fn test_optimize_convergence() {
+        // Simple 1D quadratic with minimum at x=3
+        let fitness_fn = |position: &[f64]| -> f64 {
+            (position[0] - 3.0).powi(2)
+        };
+
+        let hyperparams = Hyperparameters::new(30, 1, -10.0, 10.0);
+        let mut swarm = Swarm::new(hyperparams, &fitness_fn);
+
+        swarm.optimize(&fitness_fn, 100);
+
+        // Should converge close to x=3
+        assert!((swarm.global_best_position[0] - 3.0).abs() < 0.1);
+        assert!(swarm.global_best_fitness < 0.01);
+    }
+
+    #[test]
+    fn test_optimize_until_target() {
+        let fitness_fn = |position: &[f64]| -> f64 {
+            position.iter().map(|x| x * x).sum()
+        };
+
+        let hyperparams = Hyperparameters::new(30, 2, -10.0, 10.0);
+        let mut swarm = Swarm::new(hyperparams, &fitness_fn);
+
+        // Optimize until fitness is below 0.1
+        let history = swarm.optimize_until(&fitness_fn, 1000, 0.1);
+
+        // Should have terminated before max iterations (very likely)
+        assert!(history.len() <= 1000);
+
+        // Final fitness should be below target
+        assert!(swarm.global_best_fitness < 0.1);
+    }
+
+    #[test]
+    fn test_parallel_fitness_evaluation() {
+        // A fitness function that could benefit from parallelization
+        let fitness_fn = |position: &[f64]| -> f64 {
+            position.iter().map(|x| x * x).sum()
+        };
+
+        let hyperparams = Hyperparameters::new(100, 5, -10.0, 10.0);
+        let mut swarm = Swarm::new(hyperparams, &fitness_fn);
+
+        // This should run without issues and utilize parallel evaluation
+        let history = swarm.optimize(&fitness_fn, 10);
+
+        assert_eq!(history.len(), 10);
+        assert!(swarm.global_best_fitness.is_finite());
     }
 }
