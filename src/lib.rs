@@ -5,11 +5,16 @@
 
 use rand::Rng;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+// Public modules
+pub mod cosm;
+pub mod results;
 
 /// Historical data from optimization iterations
 ///
 /// Stores data for each iteration to enable visualization and analysis
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationHistory {
     /// Iteration number
     pub iteration: usize,
@@ -26,7 +31,7 @@ pub struct IterationHistory {
 /// Complete optimization history
 ///
 /// Contains all iteration data for visualization in Phase 4
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationHistory {
     /// History for each iteration
     pub iterations: Vec<IterationHistory>,
