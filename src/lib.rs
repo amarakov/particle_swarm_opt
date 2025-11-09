@@ -6,10 +6,12 @@
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use strategies::*;
 
 // Public modules
 pub mod cosm;
 pub mod results;
+pub mod strategies;
 pub mod visualization;
 
 /// Historical data from optimization iterations
@@ -82,11 +84,11 @@ impl Default for OptimizationHistory {
 }
 
 /// Hyperparameters for the Particle Swarm Optimization algorithm
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Hyperparameters {
     /// Number of particles in the swarm
     pub swarm_size: usize,
-    /// Inertia weight - controls the influence of previous velocity
+    /// Inertia weight - controls the influence of previous velocity (used for backward compatibility)
     pub inertia_weight: f64,
     /// Cognitive coefficient - controls attraction to particle's best position
     pub cognitive_coeff: f64,
@@ -96,10 +98,42 @@ pub struct Hyperparameters {
     pub lower_bounds: Vec<f64>,
     /// Upper bounds for each dimension
     pub upper_bounds: Vec<f64>,
+    /// Strategy for initializing particles
+    pub initialization_strategy: Box<dyn InitializationStrategy>,
+    /// Strategy for handling boundary violations
+    pub boundary_strategy: Box<dyn BoundaryStrategy>,
+    /// Strategy for calculating inertia weight
+    pub inertia_strategy: Box<dyn InertiaStrategy>,
+    /// Strategy for topology (how particles share information)
+    pub topology_strategy: Box<dyn TopologyStrategy>,
+}
+
+// Manual Debug implementation since trait objects don't auto-derive Debug
+impl std::fmt::Debug for Hyperparameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hyperparameters")
+            .field("swarm_size", &self.swarm_size)
+            .field("inertia_weight", &self.inertia_weight)
+            .field("cognitive_coeff", &self.cognitive_coeff)
+            .field("social_coeff", &self.social_coeff)
+            .field("lower_bounds", &self.lower_bounds)
+            .field("upper_bounds", &self.upper_bounds)
+            .field("initialization_strategy", &"<strategy>")
+            .field("boundary_strategy", &"<strategy>")
+            .field("inertia_strategy", &"<strategy>")
+            .field("topology_strategy", &"<strategy>")
+            .finish()
+    }
 }
 
 impl Hyperparameters {
-    /// Creates a new Hyperparameters struct with default PSO values
+    /// Creates a new Hyperparameters struct with default PSO values and strategies
+    ///
+    /// Uses:
+    /// - Uniform initialization
+    /// - Reflect boundary handling
+    /// - Constant inertia (0.7)
+    /// - Global best topology
     ///
     /// # Arguments
     ///
@@ -114,15 +148,21 @@ impl Hyperparameters {
     pub fn new(swarm_size: usize, dimensions: usize, lower_bound: f64, upper_bound: f64) -> Self {
         Self {
             swarm_size,
-            inertia_weight: 0.7,      // Standard value
+            inertia_weight: 0.7,      // Standard value (backward compatibility)
             cognitive_coeff: 1.5,     // Standard value
             social_coeff: 1.5,        // Standard value
             lower_bounds: vec![lower_bound; dimensions],
             upper_bounds: vec![upper_bound; dimensions],
+            initialization_strategy: Box::new(UniformInitialization),
+            boundary_strategy: Box::new(ReflectBoundary),
+            inertia_strategy: Box::new(ConstantInertia::new(0.7)),
+            topology_strategy: Box::new(GlobalBest),
         }
     }
 
     /// Creates a new Hyperparameters struct with custom bounds per dimension
+    ///
+    /// Uses default strategies (see `new` method documentation)
     ///
     /// # Arguments
     ///
@@ -146,6 +186,84 @@ impl Hyperparameters {
             social_coeff: 1.5,
             lower_bounds,
             upper_bounds,
+            initialization_strategy: Box::new(UniformInitialization),
+            boundary_strategy: Box::new(ReflectBoundary),
+            inertia_strategy: Box::new(ConstantInertia::new(0.7)),
+            topology_strategy: Box::new(GlobalBest),
+        }
+    }
+
+    /// Creates advanced hyperparameters with linearly decreasing inertia and local best topology
+    ///
+    /// This configuration is recommended for complex optimization problems as it:
+    /// - Starts with high exploration (w=0.9) and gradually focuses on exploitation (w=0.4)
+    /// - Uses local neighborhoods to maintain diversity and avoid premature convergence
+    ///
+    /// # Arguments
+    ///
+    /// * `swarm_size` - Number of particles in the swarm
+    /// * `dimensions` - Number of dimensions in the search space
+    /// * `lower_bound` - Lower bound for all dimensions
+    /// * `upper_bound` - Upper bound for all dimensions
+    ///
+    /// # Returns
+    ///
+    /// A Hyperparameters struct configured for robust optimization
+    pub fn advanced(swarm_size: usize, dimensions: usize, lower_bound: f64, upper_bound: f64) -> Self {
+        Self {
+            swarm_size,
+            inertia_weight: 0.9,      // Initial value (will be overridden by strategy)
+            cognitive_coeff: 1.5,
+            social_coeff: 1.5,
+            lower_bounds: vec![lower_bound; dimensions],
+            upper_bounds: vec![upper_bound; dimensions],
+            initialization_strategy: Box::new(UniformInitialization),
+            boundary_strategy: Box::new(ReflectBoundary),
+            inertia_strategy: Box::new(LinearlyDecreasingInertia::new()),
+            topology_strategy: Box::new(LocalBest::new()),
+        }
+    }
+
+    /// Creates hyperparameters with custom strategies
+    ///
+    /// # Arguments
+    ///
+    /// * `swarm_size` - Number of particles in the swarm
+    /// * `lower_bounds` - Lower bounds for each dimension
+    /// * `upper_bounds` - Upper bounds for each dimension
+    /// * `initialization_strategy` - Strategy for particle initialization
+    /// * `boundary_strategy` - Strategy for boundary handling
+    /// * `inertia_strategy` - Strategy for inertia weight
+    /// * `topology_strategy` - Strategy for topology
+    ///
+    /// # Returns
+    ///
+    /// A fully customized Hyperparameters struct
+    pub fn with_strategies(
+        swarm_size: usize,
+        lower_bounds: Vec<f64>,
+        upper_bounds: Vec<f64>,
+        initialization_strategy: Box<dyn InitializationStrategy>,
+        boundary_strategy: Box<dyn BoundaryStrategy>,
+        inertia_strategy: Box<dyn InertiaStrategy>,
+        topology_strategy: Box<dyn TopologyStrategy>,
+    ) -> Self {
+        assert_eq!(
+            lower_bounds.len(),
+            upper_bounds.len(),
+            "Lower and upper bounds must have the same length"
+        );
+        Self {
+            swarm_size,
+            inertia_weight: 0.7, // Placeholder, will be overridden by strategy
+            cognitive_coeff: 1.5,
+            social_coeff: 1.5,
+            lower_bounds,
+            upper_bounds,
+            initialization_strategy,
+            boundary_strategy,
+            inertia_strategy,
+            topology_strategy,
         }
     }
 
@@ -174,25 +292,26 @@ pub struct Particle {
 }
 
 impl Particle {
-    /// Creates a new particle with random position within bounds
+    /// Creates a new particle with position initialized using the given strategy
     ///
     /// # Arguments
     ///
-    /// * `hyperparams` - Reference to hyperparameters containing bounds
+    /// * `hyperparams` - Reference to hyperparameters containing bounds and strategies
     /// * `rng` - Random number generator
     ///
     /// # Returns
     ///
-    /// A new Particle with random position and zero velocity
+    /// A new Particle with initialized position and zero velocity
     fn new<R: Rng>(hyperparams: &Hyperparameters, rng: &mut R) -> Self {
         let dimensions = hyperparams.dimensions();
 
-        // Initialize position randomly within bounds
-        let position: Vec<f64> = (0..dimensions)
-            .map(|i| {
-                rng.gen_range(hyperparams.lower_bounds[i]..=hyperparams.upper_bounds[i])
-            })
-            .collect();
+        // Initialize position using the initialization strategy
+        let position = hyperparams.initialization_strategy.initialize_position(
+            dimensions,
+            &hyperparams.lower_bounds,
+            &hyperparams.upper_bounds,
+            rng,
+        );
 
         // Initialize velocity to zero (safe and common practice)
         let velocity = vec![0.0; dimensions];
@@ -268,29 +387,29 @@ impl Particle {
     /// Updates the particle's position and handles boundary violations
     ///
     /// The position is updated by adding the velocity. If the particle moves outside
-    /// the search space bounds, the "reflect" boundary handling strategy is used:
-    /// the particle's position is set to the boundary and its velocity in that
-    /// dimension is inverted, causing it to "bounce" back.
+    /// the search space bounds, the boundary handling strategy is applied.
     ///
     /// # Arguments
     ///
-    /// * `hyperparams` - Reference to hyperparameters containing bounds
-    pub fn update_position(&mut self, hyperparams: &Hyperparameters) {
+    /// * `hyperparams` - Reference to hyperparameters containing bounds and boundary strategy
+    /// * `rng` - Random number generator (used by some boundary strategies)
+    pub fn update_position<R: Rng>(&mut self, hyperparams: &Hyperparameters, rng: &mut R) {
         for i in 0..self.position.len() {
             // Update position
             self.position[i] += self.velocity[i];
 
-            // Handle lower boundary violation (reflect)
-            if self.position[i] < hyperparams.lower_bounds[i] {
-                self.position[i] = hyperparams.lower_bounds[i];
-                self.velocity[i] = -self.velocity[i]; // Invert velocity to bounce back
-            }
+            // Handle boundary violations using the boundary strategy
+            let (new_pos, new_vel) = hyperparams.boundary_strategy.handle_boundary(
+                self.position[i],
+                self.velocity[i],
+                i,
+                hyperparams.lower_bounds[i],
+                hyperparams.upper_bounds[i],
+                rng,
+            );
 
-            // Handle upper boundary violation (reflect)
-            if self.position[i] > hyperparams.upper_bounds[i] {
-                self.position[i] = hyperparams.upper_bounds[i];
-                self.velocity[i] = -self.velocity[i]; // Invert velocity to bounce back
-            }
+            self.position[i] = new_pos;
+            self.velocity[i] = new_vel;
         }
     }
 }
@@ -396,7 +515,7 @@ impl Swarm {
     /// This is the main optimization method that:
     /// 1. Evaluates fitness for all particles in parallel using Rayon
     /// 2. Updates personal and global bests
-    /// 3. Updates velocities based on PSO equations
+    /// 3. Updates velocities based on PSO equations with adaptive strategies
     /// 4. Updates positions with boundary handling
     /// 5. Records iteration history for visualization
     ///
@@ -432,6 +551,9 @@ impl Swarm {
         let mut rng = rand::thread_rng();
 
         for iteration in 0..max_iterations {
+            // Get current inertia weight from strategy
+            let current_inertia = self.hyperparameters.inertia_strategy.get_inertia(iteration, max_iterations);
+
             // Evaluate fitness for all particles in parallel
             self.particles.par_iter_mut().for_each(|particle| {
                 particle.fitness = fitness_fn(&particle.position);
@@ -468,10 +590,49 @@ impl Swarm {
                 particle_fitnesses,
             );
 
+            // Collect best positions and fitnesses for topology strategy
+            let best_positions: Vec<Vec<f64>> = self.particles
+                .iter()
+                .map(|p| p.best_position.clone())
+                .collect();
+            let best_fitnesses: Vec<f64> = self.particles
+                .iter()
+                .map(|p| p.best_fitness)
+                .collect();
+
             // Update velocities and positions for all particles
-            for particle in &mut self.particles {
-                particle.update_velocity(&self.hyperparameters, &self.global_best_position, &mut rng);
-                particle.update_position(&self.hyperparameters);
+            for (idx, particle) in self.particles.iter_mut().enumerate() {
+                // Get the best position to follow based on topology
+                let influential_best = self.hyperparameters.topology_strategy.get_best_position(
+                    idx,
+                    &best_positions,
+                    &best_fitnesses,
+                );
+
+                // Update velocity with current inertia weight
+                let w = current_inertia;
+                let c1 = self.hyperparameters.cognitive_coeff;
+                let c2 = self.hyperparameters.social_coeff;
+
+                for i in 0..particle.velocity.len() {
+                    let r1: f64 = rng.r#gen();
+                    let r2: f64 = rng.r#gen();
+
+                    // Inertia component
+                    let inertia = w * particle.velocity[i];
+
+                    // Cognitive component (attraction to personal best)
+                    let cognitive = c1 * r1 * (particle.best_position[i] - particle.position[i]);
+
+                    // Social component (attraction to influential best)
+                    let social = c2 * r2 * (influential_best[i] - particle.position[i]);
+
+                    // Update velocity
+                    particle.velocity[i] = inertia + cognitive + social;
+                }
+
+                // Update position
+                particle.update_position(&self.hyperparameters, &mut rng);
             }
         }
 
@@ -505,6 +666,9 @@ impl Swarm {
         let mut rng = rand::thread_rng();
 
         for iteration in 0..max_iterations {
+            // Get current inertia weight from strategy
+            let current_inertia = self.hyperparameters.inertia_strategy.get_inertia(iteration, max_iterations);
+
             // Evaluate fitness for all particles in parallel
             self.particles.par_iter_mut().for_each(|particle| {
                 particle.fitness = fitness_fn(&particle.position);
@@ -546,10 +710,49 @@ impl Swarm {
                 break;
             }
 
+            // Collect best positions and fitnesses for topology strategy
+            let best_positions: Vec<Vec<f64>> = self.particles
+                .iter()
+                .map(|p| p.best_position.clone())
+                .collect();
+            let best_fitnesses: Vec<f64> = self.particles
+                .iter()
+                .map(|p| p.best_fitness)
+                .collect();
+
             // Update velocities and positions for all particles
-            for particle in &mut self.particles {
-                particle.update_velocity(&self.hyperparameters, &self.global_best_position, &mut rng);
-                particle.update_position(&self.hyperparameters);
+            for (idx, particle) in self.particles.iter_mut().enumerate() {
+                // Get the best position to follow based on topology
+                let influential_best = self.hyperparameters.topology_strategy.get_best_position(
+                    idx,
+                    &best_positions,
+                    &best_fitnesses,
+                );
+
+                // Update velocity with current inertia weight
+                let w = current_inertia;
+                let c1 = self.hyperparameters.cognitive_coeff;
+                let c2 = self.hyperparameters.social_coeff;
+
+                for i in 0..particle.velocity.len() {
+                    let r1: f64 = rng.r#gen();
+                    let r2: f64 = rng.r#gen();
+
+                    // Inertia component
+                    let inertia = w * particle.velocity[i];
+
+                    // Cognitive component (attraction to personal best)
+                    let cognitive = c1 * r1 * (particle.best_position[i] - particle.position[i]);
+
+                    // Social component (attraction to influential best)
+                    let social = c2 * r2 * (influential_best[i] - particle.position[i]);
+
+                    // Update velocity
+                    particle.velocity[i] = inertia + cognitive + social;
+                }
+
+                // Update position
+                particle.update_position(&self.hyperparameters, &mut rng);
             }
         }
 
@@ -733,7 +936,7 @@ mod tests {
         particle.position = vec![1.0, 2.0];
         particle.velocity = vec![0.5, -1.0];
 
-        particle.update_position(&hyperparams);
+        particle.update_position(&hyperparams, &mut rng);
 
         // Position should be updated
         assert_eq!(particle.position, vec![1.5, 1.0]);
@@ -751,7 +954,7 @@ mod tests {
         // Test upper boundary reflection
         particle.position = vec![4.5, 0.0];
         particle.velocity = vec![1.0, 0.0];
-        particle.update_position(&hyperparams);
+        particle.update_position(&hyperparams, &mut rng);
 
         assert_eq!(particle.position[0], 5.0); // Clamped to boundary
         assert_eq!(particle.velocity[0], -1.0); // Velocity reflected
@@ -759,7 +962,7 @@ mod tests {
         // Test lower boundary reflection
         particle.position = vec![-4.5, 0.0];
         particle.velocity = vec![-1.0, 0.0];
-        particle.update_position(&hyperparams);
+        particle.update_position(&hyperparams, &mut rng);
 
         assert_eq!(particle.position[0], -5.0); // Clamped to boundary
         assert_eq!(particle.velocity[0], 1.0); // Velocity reflected
