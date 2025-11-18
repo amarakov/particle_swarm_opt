@@ -10,6 +10,7 @@ use strategies::*;
 
 // Public modules
 pub mod cosm;
+pub mod fitness_scaling;
 pub mod results;
 pub mod strategies;
 pub mod visualization;
@@ -106,6 +107,8 @@ pub struct Hyperparameters {
     pub inertia_strategy: Box<dyn InertiaStrategy>,
     /// Strategy for topology (how particles share information)
     pub topology_strategy: Box<dyn TopologyStrategy>,
+    /// Strategy for scaling fitness values (amplifies differences)
+    pub fitness_scaler: fitness_scaling::FitnessScaler,
 }
 
 // Manual Debug implementation since trait objects don't auto-derive Debug
@@ -122,6 +125,7 @@ impl std::fmt::Debug for Hyperparameters {
             .field("boundary_strategy", &"<strategy>")
             .field("inertia_strategy", &"<strategy>")
             .field("topology_strategy", &"<strategy>")
+            .field("fitness_scaler", &self.fitness_scaler)
             .finish()
     }
 }
@@ -157,6 +161,7 @@ impl Hyperparameters {
             boundary_strategy: Box::new(ReflectBoundary),
             inertia_strategy: Box::new(ConstantInertia::new(0.7)),
             topology_strategy: Box::new(GlobalBest),
+            fitness_scaler: fitness_scaling::FitnessScaler::default(),
         }
     }
 
@@ -190,6 +195,7 @@ impl Hyperparameters {
             boundary_strategy: Box::new(ReflectBoundary),
             inertia_strategy: Box::new(ConstantInertia::new(0.7)),
             topology_strategy: Box::new(GlobalBest),
+            fitness_scaler: fitness_scaling::FitnessScaler::default(),
         }
     }
 
@@ -221,6 +227,7 @@ impl Hyperparameters {
             boundary_strategy: Box::new(ReflectBoundary),
             inertia_strategy: Box::new(LinearlyDecreasingInertia::new()),
             topology_strategy: Box::new(LocalBest::new()),
+            fitness_scaler: fitness_scaling::FitnessScaler::default(),
         }
     }
 
@@ -264,12 +271,41 @@ impl Hyperparameters {
             boundary_strategy,
             inertia_strategy,
             topology_strategy,
+            fitness_scaler: fitness_scaling::FitnessScaler::default(),
         }
     }
 
     /// Returns the number of dimensions in the search space
     pub fn dimensions(&self) -> usize {
         self.lower_bounds.len()
+    }
+
+    /// Sets the fitness scaling strategy
+    ///
+    /// This is useful for optimizing functions with flat fitness landscapes
+    /// where differences between solutions are very small.
+    ///
+    /// # Arguments
+    ///
+    /// * `strategy` - The scaling strategy to use
+    ///
+    /// # Returns
+    ///
+    /// Self for method chaining
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use particle_swarm_opt::{Hyperparameters, fitness_scaling::{FitnessScaler, ScalingStrategy}};
+    ///
+    /// let mut hyperparams = Hyperparameters::new(40, 5, -10.0, 10.0);
+    /// hyperparams.with_fitness_scaling(
+    ///     FitnessScaler::new(ScalingStrategy::Exponential { beta: 0.01 })
+    /// );
+    /// ```
+    pub fn with_fitness_scaling(mut self, scaler: fitness_scaling::FitnessScaler) -> Self {
+        self.fitness_scaler = scaler;
+        self
     }
 }
 
@@ -283,12 +319,16 @@ pub struct Particle {
     pub position: Vec<f64>,
     /// Current velocity vector
     pub velocity: Vec<f64>,
-    /// Fitness value at current position
+    /// Fitness value at current position (scaled if scaling is enabled)
     pub fitness: f64,
+    /// Raw fitness value at current position (before scaling)
+    pub raw_fitness: f64,
     /// Best position this particle has found
     pub best_position: Vec<f64>,
-    /// Fitness value at the particle's best position
+    /// Fitness value at the particle's best position (scaled if scaling is enabled)
     pub best_fitness: f64,
+    /// Raw fitness value at the particle's best position (before scaling)
+    pub best_raw_fitness: f64,
 }
 
 impl Particle {
@@ -318,17 +358,21 @@ impl Particle {
 
         // Initialize fitness to worst possible value (will be updated)
         let fitness = f64::INFINITY;
+        let raw_fitness = f64::INFINITY;
 
         // Clone position for best_position (will be updated after first evaluation)
         let best_position = position.clone();
         let best_fitness = f64::INFINITY;
+        let best_raw_fitness = f64::INFINITY;
 
         Self {
             position,
             velocity,
             fitness,
+            raw_fitness,
             best_position,
             best_fitness,
+            best_raw_fitness,
         }
     }
 
@@ -336,6 +380,7 @@ impl Particle {
     pub fn update_personal_best(&mut self) {
         if self.fitness < self.best_fitness {
             self.best_fitness = self.fitness;
+            self.best_raw_fitness = self.raw_fitness;
             self.best_position = self.position.clone();
         }
     }
@@ -421,8 +466,10 @@ pub struct Swarm {
     pub particles: Vec<Particle>,
     /// Best position found by any particle in the swarm
     pub global_best_position: Vec<f64>,
-    /// Fitness value at the global best position
+    /// Fitness value at the global best position (scaled if scaling is enabled)
     pub global_best_fitness: f64,
+    /// Raw fitness value at the global best position (before scaling)
+    pub global_best_raw_fitness: f64,
     /// Hyperparameters controlling the optimization
     pub hyperparameters: Hyperparameters,
 }
@@ -463,7 +510,7 @@ impl Swarm {
     /// // Initialize the swarm
     /// let swarm = Swarm::new(hyperparams, fitness_fn);
     /// ```
-    pub fn new<F>(hyperparams: Hyperparameters, fitness_fn: F) -> Self
+    pub fn new<F>(mut hyperparams: Hyperparameters, fitness_fn: F) -> Self
     where
         F: Fn(&[f64]) -> f64,
     {
@@ -474,20 +521,33 @@ impl Swarm {
             .map(|_| Particle::new(&hyperparams, &mut rng))
             .collect();
 
-        // Evaluate initial fitness for all particles
-        for particle in &mut particles {
-            particle.fitness = fitness_fn(&particle.position);
+        // Evaluate initial raw fitness for all particles
+        let raw_fitnesses: Vec<f64> = particles
+            .iter()
+            .map(|p| fitness_fn(&p.position))
+            .collect();
+
+        // Update fitness scaler with initial values
+        hyperparams.fitness_scaler.update(&raw_fitnesses);
+
+        // Apply scaling and set both raw and scaled fitness
+        for (particle, &raw_fitness) in particles.iter_mut().zip(raw_fitnesses.iter()) {
+            particle.raw_fitness = raw_fitness;
+            particle.fitness = hyperparams.fitness_scaler.scale(raw_fitness);
+            particle.best_raw_fitness = raw_fitness;
             particle.best_fitness = particle.fitness;
             particle.best_position = particle.position.clone();
         }
 
-        // Find the global best position
+        // Find the global best position (using scaled fitness)
         let mut global_best_fitness = f64::INFINITY;
+        let mut global_best_raw_fitness = f64::INFINITY;
         let mut global_best_position = vec![0.0; hyperparams.dimensions()];
 
         for particle in &particles {
             if particle.fitness < global_best_fitness {
                 global_best_fitness = particle.fitness;
+                global_best_raw_fitness = particle.raw_fitness;
                 global_best_position = particle.position.clone();
             }
         }
@@ -496,6 +556,7 @@ impl Swarm {
             particles,
             global_best_position,
             global_best_fitness,
+            global_best_raw_fitness,
             hyperparameters: hyperparams,
         }
     }
@@ -554,37 +615,48 @@ impl Swarm {
             // Get current inertia weight from strategy
             let current_inertia = self.hyperparameters.inertia_strategy.get_inertia(iteration, max_iterations);
 
-            // Evaluate fitness for all particles in parallel
-            self.particles.par_iter_mut().for_each(|particle| {
-                particle.fitness = fitness_fn(&particle.position);
-            });
+            // Evaluate raw fitness for all particles in parallel
+            let raw_fitnesses: Vec<f64> = self.particles
+                .par_iter()
+                .map(|particle| fitness_fn(&particle.position))
+                .collect();
 
-            // Update personal bests
+            // Update fitness scaler with current iteration's fitness values
+            self.hyperparameters.fitness_scaler.update(&raw_fitnesses);
+
+            // Apply scaling and set both raw and scaled fitness
+            for (particle, &raw_fitness) in self.particles.iter_mut().zip(raw_fitnesses.iter()) {
+                particle.raw_fitness = raw_fitness;
+                particle.fitness = self.hyperparameters.fitness_scaler.scale(raw_fitness);
+            }
+
+            // Update personal bests (using scaled fitness for comparison)
             for particle in &mut self.particles {
                 particle.update_personal_best();
             }
 
-            // Find and update global best
+            // Find and update global best (using scaled fitness for comparison)
             for particle in &self.particles {
                 if particle.best_fitness < self.global_best_fitness {
                     self.global_best_fitness = particle.best_fitness;
+                    self.global_best_raw_fitness = particle.best_raw_fitness;
                     self.global_best_position = particle.best_position.clone();
                 }
             }
 
-            // Record iteration history
+            // Record iteration history (using RAW fitness values for reporting)
             let particle_positions: Vec<Vec<f64>> = self.particles
                 .iter()
                 .map(|p| p.position.clone())
                 .collect();
             let particle_fitnesses: Vec<f64> = self.particles
                 .iter()
-                .map(|p| p.fitness)
+                .map(|p| p.raw_fitness)  // Use raw fitness in history
                 .collect();
 
             history.record_iteration(
                 iteration,
-                self.global_best_fitness,
+                self.global_best_raw_fitness,  // Use raw fitness in history
                 self.global_best_position.clone(),
                 particle_positions,
                 particle_fitnesses,
@@ -669,44 +741,55 @@ impl Swarm {
             // Get current inertia weight from strategy
             let current_inertia = self.hyperparameters.inertia_strategy.get_inertia(iteration, max_iterations);
 
-            // Evaluate fitness for all particles in parallel
-            self.particles.par_iter_mut().for_each(|particle| {
-                particle.fitness = fitness_fn(&particle.position);
-            });
+            // Evaluate raw fitness for all particles in parallel
+            let raw_fitnesses: Vec<f64> = self.particles
+                .par_iter()
+                .map(|particle| fitness_fn(&particle.position))
+                .collect();
 
-            // Update personal bests
+            // Update fitness scaler with current iteration's fitness values
+            self.hyperparameters.fitness_scaler.update(&raw_fitnesses);
+
+            // Apply scaling and set both raw and scaled fitness
+            for (particle, &raw_fitness) in self.particles.iter_mut().zip(raw_fitnesses.iter()) {
+                particle.raw_fitness = raw_fitness;
+                particle.fitness = self.hyperparameters.fitness_scaler.scale(raw_fitness);
+            }
+
+            // Update personal bests (using scaled fitness for comparison)
             for particle in &mut self.particles {
                 particle.update_personal_best();
             }
 
-            // Find and update global best
+            // Find and update global best (using scaled fitness for comparison)
             for particle in &self.particles {
                 if particle.best_fitness < self.global_best_fitness {
                     self.global_best_fitness = particle.best_fitness;
+                    self.global_best_raw_fitness = particle.best_raw_fitness;
                     self.global_best_position = particle.best_position.clone();
                 }
             }
 
-            // Record iteration history
+            // Record iteration history (using RAW fitness values for reporting)
             let particle_positions: Vec<Vec<f64>> = self.particles
                 .iter()
                 .map(|p| p.position.clone())
                 .collect();
             let particle_fitnesses: Vec<f64> = self.particles
                 .iter()
-                .map(|p| p.fitness)
+                .map(|p| p.raw_fitness)  // Use raw fitness in history
                 .collect();
 
             history.record_iteration(
                 iteration,
-                self.global_best_fitness,
+                self.global_best_raw_fitness,  // Use raw fitness in history
                 self.global_best_position.clone(),
                 particle_positions,
                 particle_fitnesses,
             );
 
-            // Check termination condition
-            if self.global_best_fitness < target_fitness {
+            // Check termination condition (use raw fitness since target is in raw terms)
+            if self.global_best_raw_fitness < target_fitness {
                 break;
             }
 
